@@ -20,6 +20,8 @@ use twitch_api2::twitch_oauth2::Scope;
 use twitch_irc::login::{RefreshingLoginCredentials, TokenStorage};
 use twitch_irc::message::ServerMessage;
 use twitch_irc::{ClientConfig, TCPTransport, TwitchIRCClient};
+use twixelbox_bot::Cube;
+use twixelbox_bot::CubeArchive;
 
 #[derive(Clone, Deserialize)]
 struct TwixelBoxBotConfig {
@@ -92,12 +94,6 @@ impl Canvas {
     }
 
     // TODO: do we need to add a remove_cube?
-}
-
-#[derive(Debug)]
-struct Cube {
-    position: (u32, u32, u32),
-    color: (u8, u8, u8),
 }
 
 #[derive(Debug)]
@@ -238,11 +234,12 @@ pub async fn main() {
     // Set up the channel to send commands to the main thread which controls the canvas.
     let (tx, mut rx) = mpsc::unbounded_channel::<Command>();
 
+    let fps: f32 = 0.5;
+
     // Spawn the renderer timer thread.
     let tx2 = tx.clone();
     tokio::spawn(async move {
-        let fps: u32 = 1;
-        let frame_time_millis = std::time::Duration::from_millis((1000.0 / fps as f32) as u64);
+        let frame_time_millis = std::time::Duration::from_millis((1000.0 / fps) as u64);
         loop {
             // send render message
             tx.send(Command::Render).unwrap();
@@ -272,7 +269,7 @@ pub async fn main() {
                     debug!("{:?} sending", chat_command);
                     tx2.send(Command::AddCube(Cube {
                         position: (chat_command.x, chat_command.y, chat_command.z),
-                        color: (chat_command.r, chat_command.g, chat_command.b),
+                        colour: (chat_command.r, chat_command.g, chat_command.b),
                     }))
                     .unwrap();
                 }
@@ -281,10 +278,37 @@ pub async fn main() {
         }
     });
 
+    // Read previous cubes from db and add the to the canvas.
+
+    let sqlite_path = std::path::PathBuf::from("cube_archive.db");
+    let mut archive = CubeArchive::new(sqlite_path.clone());
+    let cubes = archive.get_cubes().expect("failed to extract cubes");
+    for cube in cubes {
+        canvas.add_cube(
+            &mut window,
+            cube.position.0,
+            cube.position.1,
+            cube.position.2,
+            cube.colour.0,
+            cube.colour.1,
+            cube.colour.2,
+        );
+    }
+
+    let frame_time = std::time::Duration::from_millis((1000.0 / fps) as u64);
+    let mut next_expected_frame = std::time::Instant::now();
     // The main thread now only receives commands and alters the canvas as required.
     while let Some(command) = rx.recv().await {
         match command {
             Command::Render => {
+                let current_time = std::time::Instant::now();
+                if current_time < next_expected_frame {
+                    eprintln!(
+                        "skipping frame at {:?}, next expected at {:?}",
+                        current_time, next_expected_frame
+                    );
+                    continue;
+                }
                 let mut v = Vec::new();
                 window.render();
                 window.snap(&mut v);
@@ -301,6 +325,23 @@ pub async fn main() {
                     }
                     None => eprintln!("Unable to convert pixels to RgbImage!"),
                 }
+                let last_attempted_frame = current_time;
+                let current_time = std::time::Instant::now();
+                let render_time = current_time.duration_since(last_attempted_frame);
+                let frames_lost = render_time.as_millis() / frame_time.as_millis();
+                if frames_lost > 0 {
+                    eprintln!(
+                        "Lost {} frames! Render time {:?}, frame time {:?}",
+                        frames_lost, render_time, frame_time
+                    );
+                }
+                next_expected_frame = last_attempted_frame
+                    .checked_add(
+                        frame_time
+                            .checked_mul(frames_lost as u32 + 1)
+                            .expect("Failed to compute lost frames"),
+                    )
+                    .expect("Failed to compute next expected frame");
             }
             Command::AddCube(cube) => {
                 canvas.add_cube(
@@ -308,10 +349,13 @@ pub async fn main() {
                     cube.position.0,
                     cube.position.1,
                     cube.position.2,
-                    cube.color.0,
-                    cube.color.1,
-                    cube.color.2,
+                    cube.colour.0,
+                    cube.colour.1,
+                    cube.colour.2,
                 );
+                archive
+                    .add_cube(cube)
+                    .expect("Failed to add cube to database");
             }
         }
     }
